@@ -9,6 +9,6 @@ dependencies = [
     "numpy>=2.3.4",
     "pandas>=2.3.3",
     "swanlab>=0.7.13",
-    "torch>=2.9.0",
+    "torch>=2.8.0",
     "transformers>=4.57.1",
 ]

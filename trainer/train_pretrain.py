@@ -56,9 +56,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 input_ids, labels=labels, attention_mask=attention_mask
             )  # ！修正：直接传入labels和attention_mask，由模型内部计算loss
 
-            loss = (
-                res.loss + res.aux_loss
-            )  # ！修正：原手动计算loss_fct+loss_mask，现用模型内置的loss
+            loss = res.loss
 
             loss = loss / args.accumulation_steps
 
@@ -137,7 +135,7 @@ if __name__ == "__main__":
 
     # ========== 基础训练参数 ==========
     parser.add_argument(
-        "--save_dir", type=str, default="../out", help="模型保存目录"
+        "--save_dir", type=str, default="./out", help="模型保存目录"
     )  # ！修正：原"out"缺少../前缀
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
@@ -145,7 +143,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）"
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
 
     # ========== 硬件和性能参数 ==========
@@ -160,7 +158,7 @@ if __name__ == "__main__":
 
     # ========== 训练策略参数 ==========
     parser.add_argument(
-        "--accumulation_steps", type=int, default=8, help="梯度累积步数"
+        "--accumulation_steps", type=int, default=16, help="梯度累积步数"
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
@@ -184,7 +182,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
+        default="./dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
         help="预训练数据路径",
     )
     parser.add_argument(
@@ -246,7 +244,7 @@ if __name__ == "__main__":
     # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
         lm_checkpoint(
-            lm_config, weight=args.save_weight, save_dir="../checkpoints"
+            lm_config, weight=args.save_weight, save_dir="./checkpoints"
         )  # ！修正：原"checkpoints"缺少../前缀
         if args.from_resume == 1
         else None

@@ -1,4 +1,3 @@
-
 import os
 import random
 import math
@@ -26,6 +25,7 @@ def get_lr(current_step, total_steps, lr):
     )  # ！修正：原公式 step=0 时 lr=1.1*lr 超出设定值，现修正为 step=0→lr, step=end→0.1*lr
 
 
+# 用于用多块显卡进行分布式训练
 # 初始化分布式
 def init_distributed_mode():
     if int(os.environ.get("RANK", -1)) == -1:
@@ -133,7 +133,8 @@ def init_model(
     save_dir="../out",
     device="cuda",
 ):
-    from transformers import AutoTokenizer
+    import json
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
     from model.model import MtyMindForCausalLM
 
     # 如果没有指定 tokenizer_path，使用项目根目录下的 model 文件夹
@@ -143,7 +144,27 @@ def init_model(
         project_root = os.path.dirname(current_dir)
         tokenizer_path = os.path.join(project_root, "model")
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    except ValueError as err:
+        tokenizer_file = os.path.join(tokenizer_path, "tokenizer.json")
+        tokenizer_cfg_file = os.path.join(tokenizer_path, "tokenizer_config.json")
+
+        if not os.path.exists(tokenizer_file):
+            raise err
+
+        special_tokens = {}
+        if os.path.exists(tokenizer_cfg_file):
+            with open(tokenizer_cfg_file, "r", encoding="utf-8") as fp:
+                tokenizer_cfg = json.load(fp)
+            for key in ["bos_token", "eos_token", "pad_token", "unk_token"]:
+                if key in tokenizer_cfg and tokenizer_cfg[key] is not None:
+                    special_tokens[key] = tokenizer_cfg[key]
+
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=tokenizer_file,
+            **special_tokens,
+        )
 
     model = MtyMindForCausalLM(lm_config)
 

@@ -201,6 +201,7 @@ class Attention(nn.Module):
         assert args.num_attention_heads % self.num_key_value_heads == 0
 
         self.n_local_heads = args.num_attention_heads # 这就是Q头
+        self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         # hidden_size:Embedding Dimension，词嵌入维度大小；
         self.head_dim = args.hidden_size // args.num_attention_heads # 每个头负责多大的维度
@@ -295,7 +296,7 @@ class Attention(nn.Module):
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
 
-            scores = F.softmax(scores,float(), dim=-1).type_as(xq)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores @ xv
         
@@ -453,6 +454,7 @@ class MtyMindForCausalLM(PreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 0,
@@ -474,8 +476,19 @@ class MtyMindForCausalLM(PreTrainedModel, GenerationMixin):
             else logits_to_keep
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        loss = None
+
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
 
         return CausalLMOutputWithPast(
+            loss = loss,
             logits = logits,
             past_key_values = past_key_values,
             hidden_states = hidden_states
