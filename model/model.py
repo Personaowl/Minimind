@@ -1,13 +1,16 @@
 from transformers import PretrainedConfig
-from typing import Optional
-
+from typing import Optional, Tuple, List, Union
 import math
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class MtyMindConfig(PretrainedConfig):
+    model_type = "mtymind"
 
     def __init__(
         self,
@@ -164,3 +167,316 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     
     return q_embed, k_embed
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int):
+    """
+    对KV进行复制拓展
+    :param bs: (Batch Size): 批次大小
+    :param slen: (Sequence Length): 序列长度
+    :param num_key_value_heads: KV 头的数量
+    :param head_dim: 每个头处理的特征维度
+    """
+
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return(
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, args:MtyMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
+        )
+
+        # 断言保护，确保总的注意力头数量能够被 KV 头数量整除
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        self.n_local_heads = args.num_attention_heads # 这就是Q头
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        # hidden_size:Embedding Dimension，词嵌入维度大小；
+        self.head_dim = args.hidden_size // args.num_attention_heads # 每个头负责多大的维度
+
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        ) # 输出层
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention") 
+            and args.flash_attention
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache=False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        前向传播函数，执行注意力计算。
+        
+        :param x: 输入张量，形状为 (Batch Size, Sequence Length, Hidden Size)
+        :param position_embeddings: 预计算的 RoPE 位置编码，包含 cos 和 sin 两个张量
+        :param past_key_value: 可选的缓存键值对，用于加速自回归生成
+        :param use_cache: 是否返回新的键值对以供后续使用
+        :param attention_mask: 可选的注意力掩码，用于屏蔽特定位置的注意力
+        """
+        # 投影，计算 Q、K、V
+        bsz, seq_len, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 把输入拆分成多个头，用view
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim) 
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        # q和k， 使用roPE
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos=cos[:seq_len], sin=sin[:seq_len])
+        # 对于k和v， 使用repeat(注意kv cache)
+        if past_key_value is not None:
+            # 如果有缓存，说明是在生成阶段，每次只处理一个新位置
+            xk = torch.cat([past_key_value[0], xk], dim=1) # 在序列长度维度拼接新的k
+            xv = torch.cat([past_key_value[1], xv], dim=1) # 在序列长度维度拼接新的v
+        past_kv = (xk, xv) if use_cache else None
+
+        xq, xk, xv = (
+            # PyTorch 的矩阵乘法 @ 只会对最后两个维度进行运算。为了让“句子里的词”互相计算分数，我们必须把“句子长度”和“头维度”放到最后面去！
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2)
+        )
+
+        # Flash加速，调库
+        if(
+            self.flash
+            and (seq_len > 1)
+            and (past_key_value is None)
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):
+            output = F.scaled_dot_product_attention(
+                xq, 
+                xk, 
+                xv, 
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True
+            )
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) # 计算注意力分数
+            scores[:, :, :, -seq_len:] += torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device), 
+                diagonal=1
+            )
+            # 最后拼接头，输出投影，返回
+
+            #为了凑齐一个 Batch，我们会补一些没用的 <PAD> 词。这段代码把这些废词的注意力分数也赋值-1e9 近似于负无穷大
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores,float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+        
+
+        # -1表示把最后两个维度合并成一个维度，变回 (Batch Size, Sequence Length, Hidden Size)
+        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+    
+
+class FeedForward(nn.Module):
+    # 初始化, 升维， 降维， 门控， dropout， 激活函数
+    def __init__(self, config: MtyMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
+     
+class MtyMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MtyMindConfig):
+        super().__init__()
+        self.layer_id = layer_id
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(config)
+
+        self.layer_id = self.layer_id
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+    ):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
+    
+class MtyMindModel(nn.Module):
+    def __init__(self, config: MtyMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList(
+            [MtyMindBlock(i, config) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        #RoPE 预计算
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        
+        batch_size, seq_length = input_ids.shape
+
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        # Embedding + dropout
+        hidden_states = self.dropout(
+            self.embed_tokens(input_ids)
+        )  # [bsz, seq_len, hidden]
+
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_length],
+            self.freqs_sin[start_pos : start_pos + seq_length],
+        )
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states, presents
+
+
+class MtyMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MtyMindConfig
+
+    def __init__(self, config: MtyMindConfig):
+        self.config = config
+        super().__init__(config)
+        self.model = MtyMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        #权重共享，输出层的权重和输入嵌入层的权重是同一个矩阵，这样可以减少模型参数量，同时也有助于模型学习更好的词向量表示。
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+
+        # logits to keep是整数，那就保留最后n个位置
+        # 生成的时候只需要最后的logits来预测下一个token
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(-logits_to_keep, int) 
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        return CausalLMOutputWithPast(
+            logits = logits,
+            past_key_values = past_key_values,
+            hidden_states = hidden_states
+        )
