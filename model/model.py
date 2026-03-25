@@ -3,6 +3,7 @@ from typing import Optional, Tuple, List, Union
 import math
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin
@@ -493,3 +494,122 @@ class MtyMindForCausalLM(PreTrainedModel, GenerationMixin):
             past_key_values = past_key_values,
             hidden_states = hidden_states
         )
+
+class MoEGate(nn.Module):
+    def __init__(self, config: MtyMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok  # 每个 token 路由到的专家数量
+        self.n_routed_experts = config.n_routed_experts  # 总的可路由专家数量
+
+        self.scoring_func = config.scoring_func  # 评分函数（如 softmax），用于计算被选中专家的权重
+        self.alpha = config.aux_loss_alpha  # 辅助损失系数，用于强制多个专家之间负载均衡，避免资源浪费
+        self.seq_aux = config.seq_aux  # 是否在整个序列层面计算负载均衡损失
+
+        self.norm_topk_prob = config.norm_topk_prob  # 是否对选出的 Top-k 专家的概率进行重新归一化
+        self.gating_dim = config.hidden_size  # 门控网络的输入维度，通常等于模型的隐藏层维度
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # kaiming初始化方法，可以方便的初始化一些合适的参数，以便更好的训练网络
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        # moe的时候，只看token值，不关心其位置，所以合并batch和seq_len维度
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)  # 将输入展平为 (Batch Size * Sequence Length, Hidden Size)
+        logits = F.linear(hidden_states, self.weight, None)  # 计算每个 token 对每个专家的打分，得到 (Batch Size * Sequence Length, n_routed_experts)
+
+        # 使用softmax对打分进行归一化
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+        
+        # 第一种方法, 序列级别的aux_loss
+        # 第二种方法， batch级别的aux_loss
+
+        # 从所有专家的打分(scores)中，挑出分数最高的 top_k (比如 2) 个专家。
+        # topk_weight: 被选中专家的具体分数 (例如: [0.6, 0.3])
+        # topk_idx: 被选中专家的编号索引 (例如: [1, 3] 代表选了 1号和3号专家)
+        # dim=-1 表示在最后一个维度(专家维度)上进行挑选，sorted=False 表示挑出来的结果不需要按大小排好序(为了省算力)。
+        topk_weight, topk_idx = torch.topk(
+            scores, self.top_k, dim=-1, sorted=False
+        )
+
+        # 第一步：权重归一化
+        # 当选择多个专家时，需要对选中专家的权重进行标准化
+        # 目的：确保每个token对多个专家的权重和为1，避免权重积累过大
+        if self.top_k > 1 and self.norm_topk_prob:
+            # keepdim=True 是为了保持矩阵维度不变，方便后续做除法。
+            # + 1e-20 (极其微小的数) 是为了防止分数加起来刚好等于 0，导致后面除以 0 报错。
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+
+            # 用每个专家的原始分数除以总分。
+            # 这样新的权重加起来就绝对等于 1.0 (100%) 了。
+            topk_weight = topk_weight / denominator
+
+
+        # 第二步: 计算辅助损失 (Auxiliary Loss) 仅在训练时
+        # 目的：防止“胜者为王”现象，确保所有专家都能得到充分训练（负载均衡）
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+
+            # topk_idx 原本的形状是 [总词数(bsz * seq_len), 2]。
+            # 现在把它强行改变形状为 [批次大小(bsz), 剩下的维度自动算(-1)]。
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            
+            if self.seq_aux:
+                # 策略 A: 序列级辅助损失 (Sequence-level Auxiliary Loss)
+                # 计算每个 Batch 内每个序列的专家使用频率
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                # ce 的意思是 "count of experts"，用来统计每句话里，每个专家到底被翻了多少次牌子。
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
+                # 统计每个专家被选中的次数
+
+                # 1 表示沿着第 1 维度 (专家维度) 操作。
+                # topk_idx_for_aux_loss (每个词选中的专家编号)。
+                # 这行代码的意思是：顺着选中的专家编号，把 1 累加到空白记账本 `ce` 上。
+                # 算完后，`ce` 里可能长这样：[[3, 1, 2, 0], [1, 2, 1, 2]] (代表第一句话里，0号专家被喊了 3次，3号一次没喊)。
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                )
+                
+                # ce 除以总的选择次数，得到每个专家的使用频率 (fi)，
+                ce=ce.div_(seq_len * aux_topk / self.n_routed_experts)
+                
+                # 计算专家得分与使用频率的乘积，鼓励均匀分布
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.alpha
+            else:
+                # 策略 B: 全局/Batch级辅助损失
+                # 使用 One-hot 编码统计所有专家被选中的整体比例
+                # 把所有被选中的专家编号展平变成一维数组，比如 [1, 3, 0, 1, 2, 1...]
+                # 然后 F.one_hot 会把每个编号变成 [0,1,0,0] 这样的独立卡片。
+                # mask_ce 是一个巨大的表格：行数是被选出的总人次(12)，列数是专家总数(4)。
+                # 被选中的专家那一列是 1，其他列是 0。
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                ce = mask_ce.float().mean(0)  # 每个专家被选中的实际频率 (fi)
+                Pi = scores_for_aux.mean(0)   # 每个专家的平均门控得分 (Pi)
+                fi = ce * self.n_routed_experts
+                # 损失函数 = sum(Pi * fi)，当 Pi 和 fi 均为均匀分布时该值最小
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            # 非训练模式或 alpha 为 0 时，不计算辅助损失
+            # 直接新建一个数值为 0 的 1维张量作为 aux_loss 返回去，省下算力。
+            aux_loss = scores.new_zeros(1).squeeze()
+            
+        return topk_idx, topk_weight, aux_loss
