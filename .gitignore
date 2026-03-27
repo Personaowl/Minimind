@@ -6,6 +6,8 @@ dist/
 wheels/
 *.egg-info
 dataset/*.jsonl
+weight/*.pth
+out/*.pth
 
 # Virtual environments
 .venv

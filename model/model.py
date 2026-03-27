@@ -344,8 +344,9 @@ class MtyMindBlock(nn.Module):
         self.layer_id = self.layer_id
         self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config)
-
+        self.mlp = (
+            FeedForward(config) if not config.use_moe else MoEFeedForward(config)
+        )
     def forward(
         self,
         hidden_states,
@@ -423,6 +424,7 @@ class MtyMindModel(nn.Module):
             self.freqs_sin[start_pos : start_pos + seq_length],
         )
         presents = []
+        total_aux_loss = torch.tensor(0.0, device=hidden_states.device)
         for layer_idx, (layer, past_key_value) in enumerate(
             zip(self.layers, past_key_values)
         ):
@@ -434,10 +436,12 @@ class MtyMindModel(nn.Module):
                 attention_mask=attention_mask,
             )
             presents.append(present)
+            if self.config.use_moe and hasattr(layer.mlp, "aux_loss"):
+                total_aux_loss += layer.mlp.aux_loss
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, presents
+        return hidden_states, presents, total_aux_loss
 
 
 class MtyMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -461,7 +465,7 @@ class MtyMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **args,
     ):
-        hidden_states, past_key_values = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -487,6 +491,8 @@ class MtyMindForCausalLM(PreTrainedModel, GenerationMixin):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            if aux_loss is not None:
+                loss += aux_loss
 
         return CausalLMOutputWithPast(
             loss = loss,
@@ -613,3 +619,129 @@ class MoEGate(nn.Module):
             aux_loss = scores.new_zeros(1).squeeze()
             
         return topk_idx, topk_weight, aux_loss
+
+
+class MoEFeedForward(nn.Module):
+    """
+    混合专家 (MoE) 前馈神经网络层。
+    通过门控机制将输入路由到多个专家网络中的一部分，以实现参数量的扩展同时保持计算量可控。
+    """
+    def __init__(self, config: MtyMindConfig):
+        super().__init__()
+        self.config = config
+        # 路由专家列表：每个专家都是一个标准的前馈神经网络 (FeedForward)
+        self.experts = nn.ModuleList(
+            [FeedForward(config) for _ in range(config.n_routed_experts)]
+        )
+        # 门控网络：负责决定每个 token 应该由哪些专家处理
+        self.gate = MoEGate(config)
+        # 共享专家：所有 token 都会经过这些专家，用于捕获通用知识
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
+            )
+
+    def forward(self, x):
+        """
+        前向传播函数。
+        
+        :param x: 输入张量，形状为 (Batch Size, Sequence Length, Hidden Size)
+        """
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, h = orig_shape
+
+        # 1. 门控决策：计算每个 token 的专家索引、权重以及辅助损失
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        
+        # 展平输入以方便按 token 处理
+        x = x.view(-1, x.shape[-1])
+        flat_topk_idx = topk_idx.view(-1)
+
+        if self.training:
+            # 训练模式：采用易于求导的方式处理
+            # 对于每个 token，重复输入以匹配 top-k 专家数量，然后分别送入对应的专家处理，最后根据门控权重加权求和。
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # 预先创建一个空的输出张量，形状与输入相同，用于存储专家的输出结果
+            y = torch.empty_like(x, dtype=x.dtype)
+            
+            # 遍历所有专家，处理被路由到该专家的 token
+            for i, expert in enumerate(self.experts):
+                # 1. 挑选出被路由到当前专家 i 的 token
+                # 通过比较 flat_topk_idx 和当前专家编号 i，创建一个布尔掩码，标记哪些 token 被路由到该专家。
+                # 例如，如果 flat_topk_idx 是 [1, 3, 0, 1, 2]，当 i=1 时，mask 就是 [True, False, False, True, False]，表示第 0 和第 3 个 token 被路由到专家 1。
+                mask = (flat_topk_idx == i)
+                # 2. 专家处理：将被路由到当前专家的 token 输入到该专家网络中，得到输出结果。
+                if mask.any():
+                    expert_out = expert(x[mask])
+                    y[mask] = expert_out.to(y.dtype)
+                else:
+                    # 把所有参数加起来，并乘以0.0，得到一个带有计算图的标量0
+                    dummy_grad = sum(p.sum() for p in expert.parameters()) * 0.0
+                    y = y + dummy_grad.to(y.dtype)
+            
+            # 2. 加权求和：根据门控权重合并多个专家的输出
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        else:
+            # 推理模式：使用高效的 moe_infer 方法
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
+
+        # 3. 结合共享专家
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        """
+        MoE 高效推理方法。
+        通过对专家索引排序和分包处理，减少显存拷贝和调用的碎片化。
+        """
+        expert_cache = torch.zeros_like(x)
+        
+        # 排序：将指向同一专家的 token 聚集在一起
+        # 按专家编号从小到大排序！
+        # argsort 返回的是“排序后的元素在原来列表里的位置(索引)”
+        # flat_expert_indices 里是: [1, 3, 0, 1, 2, 1]
+        # 排序后应该是: [0, 1, 1, 1, 2, 3]
+        # 它们原本的位置(idxs)是: [2, 0, 3, 5, 4, 1]
+        idxs = flat_expert_indices.argsort()
+        
+        # 统计每个专家分配到的 token 总数（累加得到边界）
+        # bincount 统计每个专家接了几个活：0号接1个，1号接3个，2号接1个，3号接1个 -> [1, 3, 1, 1]
+        # cumsum 累加求和，算出在排序列表里的“切割线” -> [1, 4, 5, 6]
+        tokens_per_expert = flat_expert_indices.bincount(minlength=len(self.experts)).cpu().numpy().cumsum(0)
+        
+        # 4. 追踪原词的主人
+        # idxs 里存的是展平后的任务序号，比如 0,1 属于词0；2,3属于词1；4,5属于词2。
+        # 直接整除 top_k (这里是2)，瞬间还原出这个任务到底是哪个词的！
+        # 比如 idxs 里的 [2, 0, 3, 5, 4, 1] // 2 -> 变成了 [1, 0, 1, 2, 2, 0]
+        token_idxs = idxs // self.config.num_experts_per_tok
+        
+        for i, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            
+            expert = self.experts[i]
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            
+            # 批量读取并处理
+            expert_tokens = x[exp_token_idx]
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            
+            # 乘上对应的门控权重
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            
+            # 写回结果缓存
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+
+        return expert_cache

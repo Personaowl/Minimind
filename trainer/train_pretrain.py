@@ -124,7 +124,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",  # ！修正：原"checkpoints"缺少../前缀
+                save_dir="./checkpoints",  # ！修正：原"checkpoints"缺少../前缀
             )
 
             model.train()  # 恢复训练模式
