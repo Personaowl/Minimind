@@ -54,7 +54,7 @@ def main():
         type=str,
         help="模型加载路径（model=原生torch权重，其他路径=transformers格式）",
     )
-    parser.add_argument("--save_dir", default="out", type=str, help="模型权重目录")
+    parser.add_argument("--save_dir", default="weight", type=str, help="模型权重目录")
     parser.add_argument(
         "--weight",
         default="pretrain",
@@ -81,7 +81,7 @@ def main():
     )
     parser.add_argument(
         "--use_moe",
-        default=0,
+        default=1,
         type=int,
         choices=[0, 1],
         help="是否使用MoE架构（0=否，1=是）",
