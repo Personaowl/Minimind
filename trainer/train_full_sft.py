@@ -218,7 +218,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/sft_mini_512.jsonl",
+        default="./dataset/sft_mini_512.jsonl",
         help="训练数据路径",
     )
     parser.add_argument(
@@ -277,7 +277,7 @@ if __name__ == "__main__":
     )
     # 尝试加载断点续训数据
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="../checkpoints")
+        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="./checkpoints")
         if args.from_resume == 1
         else None
     )
@@ -316,10 +316,12 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     """
     📚 SFT vs Pretrain 数据集差异：
-    - SFT: SFTDataset - 监督微调数据集，包含instruction和response
-    - Pretrain: PretrainDataset - 预训练数据集，包含原始文本和mask
+    # SFT: SFTDataset - 监督微调数据集，包含instruction和response
+    # Pretrain: PretrainDataset - 预训练数据集，包含原始文本和mask
     """
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(
+        lm_config, args.from_weight, save_dir=args.save_dir, device=args.device
+    )
 
     # 📚 torch.compile加速：JIT编译模型获得20%~40%性能提升
     if args.use_compile == 1:
