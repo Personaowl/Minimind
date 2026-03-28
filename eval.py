@@ -31,10 +31,8 @@ def init_model(args):
         # ！修正：原缺少LoRA加载逻辑
         if args.lora_weight != "None":
             apply_lora(model)
-            load_lora(
-                model,
-                f"./{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth",
-            )
+            lora_path = f"./checkpoints/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth"
+            load_lora(model, lora_path)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.load_from, trust_remote_code=True
