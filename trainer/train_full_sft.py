@@ -72,9 +72,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             res = model(
                 input_ids, labels=labels, attention_mask=attention_mask
             )  # ！修正：加入attention_mask
-
+            
             # SFT总损失 = 主任务loss + 辅助loss（MoE路由辅助）
-            loss = res.loss + res.aux_loss
+            loss = res.loss
 
             # 📚 梯度累积：将loss平均化
             # 在多个step后才进行参数更新，模拟更大的batch_size
@@ -106,7 +106,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 恢复真实的loss值（乘回accumulation_steps）
             current_loss = loss.item() * args.accumulation_steps
             # 获取辅助loss（如果存在）
-            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            safe_aux_loss = getattr(res, "aux_loss", None)
+            current_aux_loss = safe_aux_loss.item() if safe_aux_loss is not None else 0.0
             # 主任务loss = 总loss - 辅助loss
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]["lr"]

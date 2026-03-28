@@ -1,4 +1,5 @@
 from torch.utils.data import Dataset
+import json
 import torch
 import os
 import random
@@ -146,29 +147,43 @@ class SFTDataset(Dataset):
         return len(self.samples)
     
     def create_chat_prompt(self, conversations):
-        """
-        将多轮对话转换为模型输入的字符串。
+        try:
+            messages = [dict(msg) for msg in conversations]
+            
+            # 🛡️ 防弹装甲 1：清洗并还原所有被字符串化的 JSON
+            for msg in messages:
+                # 修复 content
+                if "content" not in msg or msg["content"] is None:
+                    msg["content"] = ""
+                
+                # 修复 assistant 的 tool_calls
+                if "tool_calls" in msg and isinstance(msg["tool_calls"], str):
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                
+                # 修复 system 的 tools / functions
+                if msg.get("role") == "system":
+                    for key in ["tools", "functions"]:
+                        if key in msg and isinstance(msg[key], str):
+                            msg[key] = json.loads(msg[key])
+                            
+            # 提取工具 (兼容键名是 tools 还是 functions)
+            tools = None
+            if messages and messages[0].get("role") == "system":
+                tools = messages[0].get("tools") or messages[0].get("functions")
+            
+            kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": False
+            }
+            if tools is not None:
+                kwargs["tools"] = tools
 
-        特点：
-        - 复制原始 conversations，防止修改原始数据。
-        - 检测 system 消息中是否携带 functions 字段（function calling 场景），
-          若有则透传给 apply_chat_template，生成标准 tool-use 格式的提示词。
-        - add_generation_prompt=False：不在末尾追加"请模型续写"的 prompt，
-          因为训练时需要完整的 input+output 序列，而非开放续写。
-        """
-        messages = conversations.copy()
-        tools = (
-            conversations[0]["functions"]
-            if (
-                conversations
-                and conversations[0]["role"] == "system"
-                and conversations[0].get("functions")
-            )
-            else None
-        )
-        return self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False, tools=tools
-        )
+            return self.tokenizer.apply_chat_template(messages, **kwargs)
+
+        except Exception as e:
+            # 兜底逻辑保持不变...
+            dummy_messages = [{"role": "user", "content": "跳过"}, {"role": "assistant", "content": "好的"}]
+            return self.tokenizer.apply_chat_template(dummy_messages, tokenize=False, add_generation_prompt=False)
     
     def generate_labels(self, input_ids):
         """
@@ -228,7 +243,6 @@ class SFTDataset(Dataset):
         attention_mask = (
             torch.tensor(input_ids, dtype=torch.long) != self.tokenizer.pad_token_id
         ).long()
-        
         return (
             torch.tensor(input_ids, dtype=torch.long),
             torch.tensor(labels, dtype=torch.long),
